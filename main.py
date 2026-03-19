@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog, QSpinBox,
     QCheckBox, QSplitter, QTableView, QStyledItemDelegate, QStyleOptionProgressBar,
-    QStyle, QProgressBar
+    QStyle, QProgressBar, QMessageBox
 )
 
 
@@ -562,18 +562,45 @@ class MainWindow(QMainWindow):
         # Fresh start
         url = self.url_input.text().strip()
         if not url:
-            url = "https://www.erome.com/a/"
+            QMessageBox.warning(self, "Missing URL", "Enter a valid Erome album URL before starting.")
+            return
         base_dir = self.path_input.text().strip()
         # Derive album_id folder from URL
-        album_id_match = re.search(r'erome\.com/a/(\w+)', url)
+        album_id_match = re.search(r'erome\.com/a/([\w-]+)', url)
         album_id = album_id_match.group(1) if album_id_match else "album"
         save_dir = os.path.join(base_dir, album_id)
-        os.makedirs(save_dir, exist_ok=True)
-        self.current_save_dir = save_dir
 
         # Init core (session with retries + headers)
         self.core = EromeDownloaderCore(url)
         self.session = self.core.session
+
+        # Build queue from placeholder
+        # Build queue from real Erome page
+        fetch_error: Optional[str] = None
+        try:
+            videos, images = self.core.get_file_list()
+        except Exception as e:
+            fetch_error = str(e)
+            videos, images = [], []
+        items_info: List[Tuple[str, str, str]] = []
+        for v in videos:
+            fname = os.path.basename(urlparse(v).path)
+            items_info.append((v, fname, "video"))
+        for img in images:
+            fname = os.path.basename(urlparse(img).path)
+            items_info.append((img, fname, "image"))
+
+        if not items_info:
+            self.overall_progress.setValue(0)
+            self.overall_status_label.setText("No downloadable media found for the provided album URL.")
+            details = "Could not find any downloadable media in this album."
+            if fetch_error:
+                details += f"\n\nRequest error: {fetch_error}"
+            QMessageBox.warning(self, "No Media Found", details)
+            return
+
+        os.makedirs(save_dir, exist_ok=True)
+        self.current_save_dir = save_dir
 
         # Optional metadata JSON
         if self.metadata_checkbox.isChecked():
@@ -591,19 +618,6 @@ class MainWindow(QMainWindow):
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-        # Build queue from placeholder
-        # Build queue from real Erome page
-        try:
-            videos, images = self.core.get_file_list()
-        except Exception as e:
-            videos, images = [], []
-        items_info: List[Tuple[str, str, str]] = []
-        for v in videos:
-            fname = os.path.basename(urlparse(v).path)
-            items_info.append((v, fname, "video"))
-        for img in images:
-            fname = os.path.basename(urlparse(img).path)
-            items_info.append((img, fname, "image"))
         items: List[DownloadItem] = []
         self.total_videos = 0
         self.total_images = 0
@@ -820,11 +834,16 @@ class EromeDownloaderCore:
             'Referer': 'https://www.erome.com/',
             'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive'
         }
         # set as default headers on the session
         self.session.headers.update(self.headers)
+
+    def _get_album_html(self) -> str:
+        # Avoid Brotli-only responses on environments without brotli decoding support.
+        resp = self.session.get(self.album_url, timeout=15, headers={"Accept-Encoding": "gzip, deflate"})
+        resp.raise_for_status()
+        return resp.text
 
     def _create_session(self) -> requests.Session:
         s = requests.Session()
@@ -836,9 +855,7 @@ class EromeDownloaderCore:
 
     def get_metadata(self) -> Optional[dict]:
         try:
-            resp = self.session.get(self.album_url, timeout=15)
-            resp.raise_for_status()
-            html = resp.text
+            html = self._get_album_html()
             from datetime import datetime as _dt
             metadata = {
                 'url': self.album_url,
@@ -866,9 +883,7 @@ class EromeDownloaderCore:
             return None
 
     def get_file_list(self) -> Tuple[List[str], List[str]]:
-        resp = self.session.get(self.album_url, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
+        html = self._get_album_html()
         videos: List[str] = []
         images: List[str] = []
 
